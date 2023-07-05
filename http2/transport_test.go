@@ -7,6 +7,7 @@ package http2
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -739,12 +741,13 @@ func (fw flushWriter) Write(p []byte) (n int, err error) {
 }
 
 type clientTester struct {
-	t      *testing.T
-	tr     *Transport
-	sc, cc net.Conn // server and client conn
-	fr     *Framer  // server's framer
-	client func() error
-	server func() error
+	t        *testing.T
+	tr       *Transport
+	sc, cc   net.Conn // server and client conn
+	fr       *Framer  // server's framer
+	settings *SettingsFrame
+	client   func() error
+	server   func() error
 }
 
 func newClientTester(t *testing.T) *clientTester {
@@ -772,7 +775,6 @@ func newClientTester(t *testing.T) *clientTester {
 	cc, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
-
 	}
 	sc, err := ln.Accept()
 	if err != nil {
@@ -807,9 +809,9 @@ func (ct *clientTester) greet(settings ...Setting) {
 	if err != nil {
 		ct.t.Fatalf("Reading client settings frame: %v", err)
 	}
-	if sf, ok := f.(*SettingsFrame); !ok {
+	var ok bool
+	if ct.settings, ok = f.(*SettingsFrame); !ok {
 		ct.t.Fatalf("Wanted client settings frame; got %v", f)
-		_ = sf // stash it away?
 	}
 	if err := ct.fr.WriteSettings(settings...); err != nil {
 		ct.t.Fatal(err)
@@ -830,6 +832,55 @@ func (ct *clientTester) readNonSettingsFrame() (Frame, error) {
 		}
 		return f, nil
 	}
+}
+
+// writeReadPing sends a PING and immediately reads the PING ACK.
+// It will fail if any other unread data was pending on the connection,
+// aside from SETTINGS frames.
+func (ct *clientTester) writeReadPing() error {
+	data := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	if err := ct.fr.WritePing(false, data); err != nil {
+		return fmt.Errorf("Error writing PING: %v", err)
+	}
+	f, err := ct.readNonSettingsFrame()
+	if err != nil {
+		return err
+	}
+	p, ok := f.(*PingFrame)
+	if !ok {
+		return fmt.Errorf("got a %v, want a PING ACK", f)
+	}
+	if p.Flags&FlagPingAck == 0 {
+		return fmt.Errorf("got a PING, want a PING ACK")
+	}
+	if p.Data != data {
+		return fmt.Errorf("got PING data = %x, want %x", p.Data, data)
+	}
+	return nil
+}
+
+func (ct *clientTester) inflowWindow(streamID uint32) int32 {
+	pool := ct.tr.connPoolOrDef.(*clientConnPool)
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if n := len(pool.keys); n != 1 {
+		ct.t.Errorf("clientConnPool contains %v keys, expected 1", n)
+		return -1
+	}
+	for cc := range pool.keys {
+		cc.mu.Lock()
+		defer cc.mu.Unlock()
+		if streamID == 0 {
+			return cc.inflow.avail + cc.inflow.unsent
+		}
+		cs := cc.streams[streamID]
+		if cs == nil {
+			ct.t.Errorf("no stream with id %v", streamID)
+			return -1
+		}
+		return cs.inflow.avail + cs.inflow.unsent
+	}
+	return -1
 }
 
 func (ct *clientTester) cleanup() {
@@ -1713,6 +1764,18 @@ func TestTransportChecksRequestHeaderListSize(t *testing.T) {
 	defer tr.CloseIdleConnections()
 
 	checkRoundTrip := func(req *http.Request, wantErr error, desc string) {
+		// Make an arbitrary request to ensure we get the server's
+		// settings frame and initialize peerMaxHeaderListSize.
+		req0, err := http.NewRequest("GET", st.ts.URL, nil)
+		if err != nil {
+			t.Fatalf("newRequest: NewRequest: %v", err)
+		}
+		res0, err := tr.RoundTrip(req0)
+		if err != nil {
+			t.Errorf("%v: Initial RoundTrip err = %v", desc, err)
+		}
+		res0.Body.Close()
+
 		res, err := tr.RoundTrip(req)
 		if err != wantErr {
 			if res != nil {
@@ -1773,13 +1836,9 @@ func TestTransportChecksRequestHeaderListSize(t *testing.T) {
 		return req
 	}
 
-	// Make an arbitrary request to ensure we get the server's
-	// settings frame and initialize peerMaxHeaderListSize.
+	// Validate peerMaxHeaderListSize.
 	req := newRequest()
 	checkRoundTrip(req, nil, "Initial request")
-
-	// Get the ClientConn associated with the request and validate
-	// peerMaxHeaderListSize.
 	addr := authorityAddr(req.URL.Scheme, req.URL.Host)
 	cc, err := tr.connPool().GetClientConn(req, addr)
 	if err != nil {
@@ -2503,6 +2562,28 @@ func TestGzipReader_DoubleReadCrash(t *testing.T) {
 	}
 }
 
+func TestGzipReader_ReadAfterClose(t *testing.T) {
+	body := bytes.Buffer{}
+	w := gzip.NewWriter(&body)
+	w.Write([]byte("012345679"))
+	w.Close()
+	gz := &gzipReader{
+		body: ioutil.NopCloser(&body),
+	}
+	var buf [1]byte
+	n, err := gz.Read(buf[:])
+	if n != 1 || err != nil {
+		t.Fatalf("first Read = %v, %v; want 1, nil", n, err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gz Close error: %v", err)
+	}
+	n, err = gz.Read(buf[:])
+	if n != 0 || err != fs.ErrClosed {
+		t.Fatalf("Read after close = %v, %v; want 0, fs.ErrClosed", n, err)
+	}
+}
+
 func TestTransportNewTLSConfig(t *testing.T) {
 	tests := [...]struct {
 		conf *tls.Config
@@ -2880,22 +2961,17 @@ func testTransportUsesGoAwayDebugError(t *testing.T, failMidBody bool) {
 func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 	ct := newClientTester(t)
 
-	clientClosed := make(chan struct{})
-	serverWroteFirstByte := make(chan struct{})
-
 	ct.client = func() error {
 		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
 		res, err := ct.tr.RoundTrip(req)
 		if err != nil {
 			return err
 		}
-		<-serverWroteFirstByte
 
 		if n, err := res.Body.Read(make([]byte, 1)); err != nil || n != 1 {
 			return fmt.Errorf("body read = %v, %v; want 1, nil", n, err)
 		}
 		res.Body.Close() // leaving 4999 bytes unread
-		close(clientClosed)
 
 		return nil
 	}
@@ -2930,6 +3006,7 @@ func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 			EndStream:     false,
 			BlockFragment: buf.Bytes(),
 		})
+		initialInflow := ct.inflowWindow(0)
 
 		// Two cases:
 		// - Send one DATA frame with 5000 bytes.
@@ -2938,49 +3015,62 @@ func testTransportReturnsUnusedFlowControl(t *testing.T, oneDataFrame bool) {
 		// In both cases, the client should consume one byte of data,
 		// refund that byte, then refund the following 4999 bytes.
 		//
-		// In the second case, the server waits for the client connection to
-		// close before seconding the second DATA frame. This tests the case
+		// In the second case, the server waits for the client to reset the
+		// stream before sending the second DATA frame. This tests the case
 		// where the client receives a DATA frame after it has reset the stream.
 		if oneDataFrame {
 			ct.fr.WriteData(hf.StreamID, false /* don't end stream */, make([]byte, 5000))
-			close(serverWroteFirstByte)
-			<-clientClosed
 		} else {
 			ct.fr.WriteData(hf.StreamID, false /* don't end stream */, make([]byte, 1))
-			close(serverWroteFirstByte)
-			<-clientClosed
-			ct.fr.WriteData(hf.StreamID, false /* don't end stream */, make([]byte, 4999))
 		}
 
-		waitingFor := "RSTStreamFrame"
-		sawRST := false
-		sawWUF := false
-		for !sawRST && !sawWUF {
-			f, err := ct.fr.ReadFrame()
+		wantRST := true
+		wantWUF := true
+		if !oneDataFrame {
+			wantWUF = false // flow control update is small, and will not be sent
+		}
+		for wantRST || wantWUF {
+			f, err := ct.readNonSettingsFrame()
 			if err != nil {
-				return fmt.Errorf("ReadFrame while waiting for %s: %v", waitingFor, err)
+				return err
 			}
 			switch f := f.(type) {
-			case *SettingsFrame:
 			case *RSTStreamFrame:
-				if sawRST {
-					return fmt.Errorf("saw second RSTStreamFrame: %v", summarizeFrame(f))
+				if !wantRST {
+					return fmt.Errorf("Unexpected frame: %v", summarizeFrame(f))
 				}
 				if f.ErrCode != ErrCodeCancel {
 					return fmt.Errorf("Expected a RSTStreamFrame with code cancel; got %v", summarizeFrame(f))
 				}
-				sawRST = true
+				wantRST = false
 			case *WindowUpdateFrame:
-				if sawWUF {
-					return fmt.Errorf("saw second WindowUpdateFrame: %v", summarizeFrame(f))
+				if !wantWUF {
+					return fmt.Errorf("Unexpected frame: %v", summarizeFrame(f))
 				}
-				if f.Increment != 4999 {
+				if f.Increment != 5000 {
 					return fmt.Errorf("Expected WindowUpdateFrames for 5000 bytes; got %v", summarizeFrame(f))
 				}
-				sawWUF = true
+				wantWUF = false
 			default:
 				return fmt.Errorf("Unexpected frame: %v", summarizeFrame(f))
 			}
+		}
+		if !oneDataFrame {
+			ct.fr.WriteData(hf.StreamID, false /* don't end stream */, make([]byte, 4999))
+			f, err := ct.readNonSettingsFrame()
+			if err != nil {
+				return err
+			}
+			wuf, ok := f.(*WindowUpdateFrame)
+			if !ok || wuf.Increment != 5000 {
+				return fmt.Errorf("want WindowUpdateFrame for 5000 bytes; got %v", summarizeFrame(f))
+			}
+		}
+		if err := ct.writeReadPing(); err != nil {
+			return err
+		}
+		if got, want := ct.inflowWindow(0), initialInflow; got != want {
+			return fmt.Errorf("connection flow tokens = %v, want %v", got, want)
 		}
 		return nil
 	}
@@ -3108,6 +3198,8 @@ func TestTransportReturnsDataPaddingFlowControl(t *testing.T) {
 			break
 		}
 
+		initialConnWindow := ct.inflowWindow(0)
+
 		var buf bytes.Buffer
 		enc := hpack.NewEncoder(&buf)
 		enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
@@ -3118,24 +3210,18 @@ func TestTransportReturnsDataPaddingFlowControl(t *testing.T) {
 			EndStream:     false,
 			BlockFragment: buf.Bytes(),
 		})
+		initialStreamWindow := ct.inflowWindow(hf.StreamID)
 		pad := make([]byte, 5)
 		ct.fr.WriteDataPadded(hf.StreamID, false, make([]byte, 5000), pad) // without ending stream
-
-		f, err := ct.readNonSettingsFrame()
-		if err != nil {
-			return fmt.Errorf("ReadFrame while waiting for first WindowUpdateFrame: %v", err)
+		if err := ct.writeReadPing(); err != nil {
+			return err
 		}
-		wantBack := uint32(len(pad)) + 1 // one byte for the length of the padding
-		if wuf, ok := f.(*WindowUpdateFrame); !ok || wuf.Increment != wantBack || wuf.StreamID != 0 {
-			return fmt.Errorf("Expected conn WindowUpdateFrame for %d bytes; got %v", wantBack, summarizeFrame(f))
+		// Padding flow control should have been returned.
+		if got, want := ct.inflowWindow(0), initialConnWindow-5000; got != want {
+			t.Errorf("conn inflow window = %v, want %v", got, want)
 		}
-
-		f, err = ct.readNonSettingsFrame()
-		if err != nil {
-			return fmt.Errorf("ReadFrame while waiting for second WindowUpdateFrame: %v", err)
-		}
-		if wuf, ok := f.(*WindowUpdateFrame); !ok || wuf.Increment != wantBack || wuf.StreamID == 0 {
-			return fmt.Errorf("Expected stream WindowUpdateFrame for %d bytes; got %v", wantBack, summarizeFrame(f))
+		if got, want := ct.inflowWindow(hf.StreamID), initialStreamWindow-5000; got != want {
+			t.Errorf("stream inflow window = %v, want %v", got, want)
 		}
 		unblockClient <- true
 		return nil
@@ -3412,7 +3498,7 @@ func TestClientConnPing(t *testing.T) {
 // connection.
 func TestTransportCancelDataResponseRace(t *testing.T) {
 	cancel := make(chan struct{})
-	clientGotError := make(chan bool, 1)
+	clientGotResponse := make(chan bool, 1)
 
 	const msg = "Hello."
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
@@ -3425,8 +3511,8 @@ func TestTransportCancelDataResponseRace(t *testing.T) {
 			io.WriteString(w, "Some data.")
 			w.(http.Flusher).Flush()
 			if i == 2 {
+				<-clientGotResponse
 				close(cancel)
-				<-clientGotError
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -3440,13 +3526,13 @@ func TestTransportCancelDataResponseRace(t *testing.T) {
 	req, _ := http.NewRequest("GET", st.ts.URL, nil)
 	req.Cancel = cancel
 	res, err := c.Do(req)
+	clientGotResponse <- true
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err = io.Copy(ioutil.Discard, res.Body); err == nil {
 		t.Fatal("unexpected success")
 	}
-	clientGotError <- true
 
 	res, err = c.Get(st.ts.URL + "/hello")
 	if err != nil {
@@ -3659,35 +3745,33 @@ func testTransportPingWhenReading(t *testing.T, readIdleTimeout, deadline time.D
 	ct.run()
 }
 
-func TestTransportRetryAfterGOAWAY(t *testing.T) {
-	var dialer struct {
-		sync.Mutex
-		count int
-	}
-	ct1 := make(chan *clientTester)
-	ct2 := make(chan *clientTester)
-
+func testClientMultipleDials(t *testing.T, client func(*Transport), server func(int, *clientTester)) {
 	ln := newLocalListener(t)
 	defer ln.Close()
 
+	var (
+		mu    sync.Mutex
+		count int
+		conns []net.Conn
+	)
+	var wg sync.WaitGroup
 	tr := &Transport{
 		TLSClientConfig: tlsConfigInsecure,
 	}
 	tr.DialTLS = func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-		dialer.Lock()
-		defer dialer.Unlock()
-		dialer.count++
-		if dialer.count == 3 {
-			return nil, errors.New("unexpected number of dials")
-		}
+		mu.Lock()
+		defer mu.Unlock()
+		count++
 		cc, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
 			return nil, fmt.Errorf("dial error: %v", err)
 		}
+		conns = append(conns, cc)
 		sc, err := ln.Accept()
 		if err != nil {
 			return nil, fmt.Errorf("accept error: %v", err)
 		}
+		conns = append(conns, sc)
 		ct := &clientTester{
 			t:  t,
 			tr: tr,
@@ -3695,19 +3779,25 @@ func TestTransportRetryAfterGOAWAY(t *testing.T) {
 			sc: sc,
 			fr: NewFramer(sc, sc),
 		}
-		switch dialer.count {
-		case 1:
-			ct1 <- ct
-		case 2:
-			ct2 <- ct
-		}
+		wg.Add(1)
+		go func(count int) {
+			defer wg.Done()
+			server(count, ct)
+		}(count)
 		return cc, nil
 	}
 
-	errs := make(chan error, 3)
+	client(tr)
+	tr.CloseIdleConnections()
+	ln.Close()
+	for _, c := range conns {
+		c.Close()
+	}
+	wg.Wait()
+}
 
-	// Client.
-	go func() {
+func TestTransportRetryAfterGOAWAY(t *testing.T) {
+	client := func(tr *Transport) {
 		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
 		res, err := tr.RoundTrip(req)
 		if res != nil {
@@ -3717,102 +3807,77 @@ func TestTransportRetryAfterGOAWAY(t *testing.T) {
 			}
 		}
 		if err != nil {
-			err = fmt.Errorf("RoundTrip: %v", err)
-		}
-		errs <- err
-	}()
-
-	connToClose := make(chan io.Closer, 2)
-
-	// Server for the first request.
-	go func() {
-		ct := <-ct1
-
-		connToClose <- ct.cc
-		ct.greet()
-		hf, err := ct.firstHeaders()
-		if err != nil {
-			errs <- fmt.Errorf("server1 failed reading HEADERS: %v", err)
-			return
-		}
-		t.Logf("server1 got %v", hf)
-		if err := ct.fr.WriteGoAway(0 /*max id*/, ErrCodeNo, nil); err != nil {
-			errs <- fmt.Errorf("server1 failed writing GOAWAY: %v", err)
-			return
-		}
-		errs <- nil
-	}()
-
-	// Server for the second request.
-	go func() {
-		ct := <-ct2
-
-		connToClose <- ct.cc
-		ct.greet()
-		hf, err := ct.firstHeaders()
-		if err != nil {
-			errs <- fmt.Errorf("server2 failed reading HEADERS: %v", err)
-			return
-		}
-		t.Logf("server2 got %v", hf)
-
-		var buf bytes.Buffer
-		enc := hpack.NewEncoder(&buf)
-		enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
-		enc.WriteField(hpack.HeaderField{Name: "foo", Value: "bar"})
-		err = ct.fr.WriteHeaders(HeadersFrameParam{
-			StreamID:      hf.StreamID,
-			EndHeaders:    true,
-			EndStream:     false,
-			BlockFragment: buf.Bytes(),
-		})
-		if err != nil {
-			errs <- fmt.Errorf("server2 failed writing response HEADERS: %v", err)
-		} else {
-			errs <- nil
-		}
-	}()
-
-	for k := 0; k < 3; k++ {
-		err := <-errs
-		if err != nil {
-			t.Error(err)
+			t.Errorf("RoundTrip: %v", err)
 		}
 	}
 
-	close(connToClose)
-	for c := range connToClose {
-		c.Close()
+	server := func(count int, ct *clientTester) {
+		switch count {
+		case 1:
+			ct.greet()
+			hf, err := ct.firstHeaders()
+			if err != nil {
+				t.Errorf("server1 failed reading HEADERS: %v", err)
+				return
+			}
+			t.Logf("server1 got %v", hf)
+			if err := ct.fr.WriteGoAway(0 /*max id*/, ErrCodeNo, nil); err != nil {
+				t.Errorf("server1 failed writing GOAWAY: %v", err)
+				return
+			}
+		case 2:
+			ct.greet()
+			hf, err := ct.firstHeaders()
+			if err != nil {
+				t.Errorf("server2 failed reading HEADERS: %v", err)
+				return
+			}
+			t.Logf("server2 got %v", hf)
+
+			var buf bytes.Buffer
+			enc := hpack.NewEncoder(&buf)
+			enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+			enc.WriteField(hpack.HeaderField{Name: "foo", Value: "bar"})
+			err = ct.fr.WriteHeaders(HeadersFrameParam{
+				StreamID:      hf.StreamID,
+				EndHeaders:    true,
+				EndStream:     false,
+				BlockFragment: buf.Bytes(),
+			})
+			if err != nil {
+				t.Errorf("server2 failed writing response HEADERS: %v", err)
+			}
+		default:
+			t.Errorf("unexpected number of dials")
+			return
+		}
 	}
+
+	testClientMultipleDials(t, client, server)
 }
 
 func TestTransportRetryAfterRefusedStream(t *testing.T) {
 	clientDone := make(chan struct{})
-	ct := newClientTester(t)
-	ct.client = func() error {
-		defer ct.cc.(*net.TCPConn).CloseWrite()
-		if runtime.GOOS == "plan9" {
-			// CloseWrite not supported on Plan 9; Issue 17906
-			defer ct.cc.(*net.TCPConn).Close()
-		}
+	client := func(tr *Transport) {
 		defer close(clientDone)
 		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
-		resp, err := ct.tr.RoundTrip(req)
+		resp, err := tr.RoundTrip(req)
 		if err != nil {
-			return fmt.Errorf("RoundTrip: %v", err)
+			t.Errorf("RoundTrip: %v", err)
+			return
 		}
 		resp.Body.Close()
 		if resp.StatusCode != 204 {
-			return fmt.Errorf("Status = %v; want 204", resp.StatusCode)
+			t.Errorf("Status = %v; want 204", resp.StatusCode)
+			return
 		}
-		return nil
 	}
-	ct.server = func() error {
+
+	server := func(_ int, ct *clientTester) {
 		ct.greet()
 		var buf bytes.Buffer
 		enc := hpack.NewEncoder(&buf)
-		nreq := 0
-
+		var count int
 		for {
 			f, err := ct.fr.ReadFrame()
 			if err != nil {
@@ -3821,19 +3886,20 @@ func TestTransportRetryAfterRefusedStream(t *testing.T) {
 					// If the client's done, it
 					// will have reported any
 					// errors on its side.
-					return nil
 				default:
-					return err
+					t.Error(err)
 				}
+				return
 			}
 			switch f := f.(type) {
 			case *WindowUpdateFrame, *SettingsFrame:
 			case *HeadersFrame:
 				if !f.HeadersEnded() {
-					return fmt.Errorf("headers should have END_HEADERS be ended: %v", f)
+					t.Errorf("headers should have END_HEADERS be ended: %v", f)
+					return
 				}
-				nreq++
-				if nreq == 1 {
+				count++
+				if count == 1 {
 					ct.fr.WriteRSTStream(f.StreamID, ErrCodeRefusedStream)
 				} else {
 					enc.WriteField(hpack.HeaderField{Name: ":status", Value: "204"})
@@ -3845,11 +3911,13 @@ func TestTransportRetryAfterRefusedStream(t *testing.T) {
 					})
 				}
 			default:
-				return fmt.Errorf("Unexpected client frame %v", f)
+				t.Errorf("Unexpected client frame %v", f)
+				return
 			}
 		}
 	}
-	ct.run()
+
+	testClientMultipleDials(t, client, server)
 }
 
 func TestTransportRetryHasLimit(t *testing.T) {
@@ -3857,6 +3925,12 @@ func TestTransportRetryHasLimit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping long test in short mode")
 	}
+	retryBackoffHook = func(d time.Duration) *time.Timer {
+		return time.NewTimer(0) // fires immediately
+	}
+	defer func() {
+		retryBackoffHook = nil
+	}()
 	clientDone := make(chan struct{})
 	ct := newClientTester(t)
 	ct.client = func() error {
@@ -3968,6 +4042,44 @@ func TestTransportResponseDataBeforeHeaders(t *testing.T) {
 	ct.run()
 }
 
+func TestTransportMaxFrameReadSize(t *testing.T) {
+	for _, test := range []struct {
+		maxReadFrameSize uint32
+		want             uint32
+	}{{
+		maxReadFrameSize: 64000,
+		want:             64000,
+	}, {
+		maxReadFrameSize: 1024,
+		want:             minMaxFrameSize,
+	}} {
+		ct := newClientTester(t)
+		ct.tr.MaxReadFrameSize = test.maxReadFrameSize
+		ct.client = func() error {
+			req, _ := http.NewRequest("GET", "https://dummy.tld/", http.NoBody)
+			ct.tr.RoundTrip(req)
+			return nil
+		}
+		ct.server = func() error {
+			defer ct.cc.(*net.TCPConn).Close()
+			ct.greet()
+			var got uint32
+			ct.settings.ForeachSetting(func(s Setting) error {
+				switch s.ID {
+				case SettingMaxFrameSize:
+					got = s.Val
+				}
+				return nil
+			})
+			if got != test.want {
+				t.Errorf("Transport.MaxReadFrameSize = %v; server got %v, want %v", test.maxReadFrameSize, got, test.want)
+			}
+			return nil
+		}
+		ct.run()
+	}
+}
+
 func TestTransportRequestsLowServerLimit(t *testing.T) {
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
 	}, optOnlyServer, func(s *Server) {
@@ -4020,6 +4132,7 @@ func TestTransportRequestsStallAtServerLimit(t *testing.T) {
 	greet := make(chan struct{})      // server sends initial SETTINGS frame
 	gotRequest := make(chan struct{}) // server received a request
 	clientDone := make(chan struct{})
+	cancelClientRequest := make(chan struct{})
 
 	// Collect errors from goroutines.
 	var wg sync.WaitGroup
@@ -4098,9 +4211,8 @@ func TestTransportRequestsStallAtServerLimit(t *testing.T) {
 				req, _ := http.NewRequest("GET", fmt.Sprintf("https://dummy.tld/%d", k), body)
 				if k == maxConcurrent {
 					// This request will be canceled.
-					cancel := make(chan struct{})
-					req.Cancel = cancel
-					close(cancel)
+					req.Cancel = cancelClientRequest
+					close(cancelClientRequest)
 					_, err := ct.tr.RoundTrip(req)
 					close(clientRequestCancelled)
 					if err == nil {
@@ -4190,6 +4302,150 @@ func TestTransportRequestsStallAtServerLimit(t *testing.T) {
 		}
 	}
 
+	ct.run()
+}
+
+func TestTransportMaxDecoderHeaderTableSize(t *testing.T) {
+	ct := newClientTester(t)
+	var reqSize, resSize uint32 = 8192, 16384
+	ct.tr.MaxDecoderHeaderTableSize = reqSize
+	ct.client = func() error {
+		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+		cc, err := ct.tr.NewClientConn(ct.cc)
+		if err != nil {
+			return err
+		}
+		_, err = cc.RoundTrip(req)
+		if err != nil {
+			return err
+		}
+		if got, want := cc.peerMaxHeaderTableSize, resSize; got != want {
+			return fmt.Errorf("peerHeaderTableSize = %d, want %d", got, want)
+		}
+		return nil
+	}
+	ct.server = func() error {
+		buf := make([]byte, len(ClientPreface))
+		_, err := io.ReadFull(ct.sc, buf)
+		if err != nil {
+			return fmt.Errorf("reading client preface: %v", err)
+		}
+		f, err := ct.fr.ReadFrame()
+		if err != nil {
+			return err
+		}
+		sf, ok := f.(*SettingsFrame)
+		if !ok {
+			ct.t.Fatalf("wanted client settings frame; got %v", f)
+			_ = sf // stash it away?
+		}
+		var found bool
+		err = sf.ForeachSetting(func(s Setting) error {
+			if s.ID == SettingHeaderTableSize {
+				found = true
+				if got, want := s.Val, reqSize; got != want {
+					return fmt.Errorf("received SETTINGS_HEADER_TABLE_SIZE = %d, want %d", got, want)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("missing SETTINGS_HEADER_TABLE_SIZE setting")
+		}
+		if err := ct.fr.WriteSettings(Setting{SettingHeaderTableSize, resSize}); err != nil {
+			ct.t.Fatal(err)
+		}
+		if err := ct.fr.WriteSettingsAck(); err != nil {
+			ct.t.Fatal(err)
+		}
+
+		for {
+			f, err := ct.fr.ReadFrame()
+			if err != nil {
+				return err
+			}
+			switch f := f.(type) {
+			case *HeadersFrame:
+				var buf bytes.Buffer
+				enc := hpack.NewEncoder(&buf)
+				enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				ct.fr.WriteHeaders(HeadersFrameParam{
+					StreamID:      f.StreamID,
+					EndHeaders:    true,
+					EndStream:     true,
+					BlockFragment: buf.Bytes(),
+				})
+				return nil
+			}
+		}
+	}
+	ct.run()
+}
+
+func TestTransportMaxEncoderHeaderTableSize(t *testing.T) {
+	ct := newClientTester(t)
+	var peerAdvertisedMaxHeaderTableSize uint32 = 16384
+	ct.tr.MaxEncoderHeaderTableSize = 8192
+	ct.client = func() error {
+		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+		cc, err := ct.tr.NewClientConn(ct.cc)
+		if err != nil {
+			return err
+		}
+		_, err = cc.RoundTrip(req)
+		if err != nil {
+			return err
+		}
+		if got, want := cc.henc.MaxDynamicTableSize(), ct.tr.MaxEncoderHeaderTableSize; got != want {
+			return fmt.Errorf("henc.MaxDynamicTableSize() = %d, want %d", got, want)
+		}
+		return nil
+	}
+	ct.server = func() error {
+		buf := make([]byte, len(ClientPreface))
+		_, err := io.ReadFull(ct.sc, buf)
+		if err != nil {
+			return fmt.Errorf("reading client preface: %v", err)
+		}
+		f, err := ct.fr.ReadFrame()
+		if err != nil {
+			return err
+		}
+		sf, ok := f.(*SettingsFrame)
+		if !ok {
+			ct.t.Fatalf("wanted client settings frame; got %v", f)
+			_ = sf // stash it away?
+		}
+		if err := ct.fr.WriteSettings(Setting{SettingHeaderTableSize, peerAdvertisedMaxHeaderTableSize}); err != nil {
+			ct.t.Fatal(err)
+		}
+		if err := ct.fr.WriteSettingsAck(); err != nil {
+			ct.t.Fatal(err)
+		}
+
+		for {
+			f, err := ct.fr.ReadFrame()
+			if err != nil {
+				return err
+			}
+			switch f := f.(type) {
+			case *HeadersFrame:
+				var buf bytes.Buffer
+				enc := hpack.NewEncoder(&buf)
+				enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				ct.fr.WriteHeaders(HeadersFrameParam{
+					StreamID:      f.StreamID,
+					EndHeaders:    true,
+					EndStream:     true,
+					BlockFragment: buf.Bytes(),
+				})
+				return nil
+			}
+		}
+	}
 	ct.run()
 }
 
@@ -4432,6 +4688,61 @@ func BenchmarkClientResponseHeaders(b *testing.B) {
 	b.Run("  10 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 10) })
 	b.Run(" 100 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 100) })
 	b.Run("1000 Headers", func(b *testing.B) { benchSimpleRoundTrip(b, 0, 1000) })
+}
+
+func BenchmarkDownloadFrameSize(b *testing.B) {
+	b.Run(" 16k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 16*1024) })
+	b.Run(" 64k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 64*1024) })
+	b.Run("128k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 128*1024) })
+	b.Run("256k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 256*1024) })
+	b.Run("512k Frame", func(b *testing.B) { benchLargeDownloadRoundTrip(b, 512*1024) })
+}
+func benchLargeDownloadRoundTrip(b *testing.B, frameSize uint32) {
+	defer disableGoroutineTracking()()
+	const transferSize = 1024 * 1024 * 1024 // must be multiple of 1M
+	b.ReportAllocs()
+	st := newServerTester(b,
+		func(w http.ResponseWriter, r *http.Request) {
+			// test 1GB transfer
+			w.Header().Set("Content-Length", strconv.Itoa(transferSize))
+			w.Header().Set("Content-Transfer-Encoding", "binary")
+			var data [1024 * 1024]byte
+			for i := 0; i < transferSize/(1024*1024); i++ {
+				w.Write(data[:])
+			}
+		}, optQuiet,
+	)
+	defer st.Close()
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure, MaxReadFrameSize: frameSize}
+	defer tr.CloseIdleConnections()
+
+	req, err := http.NewRequest("GET", st.ts.URL, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.N = 3
+	b.SetBytes(transferSize)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		res, err := tr.RoundTrip(req)
+		if err != nil {
+			if res != nil {
+				res.Body.Close()
+			}
+			b.Fatalf("RoundTrip err = %v; want nil", err)
+		}
+		data, _ := io.ReadAll(res.Body)
+		if len(data) != transferSize {
+			b.Fatalf("Response length invalid")
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			b.Fatalf("Response code = %v; want %v", res.StatusCode, http.StatusOK)
+		}
+	}
 }
 
 func activeStreams(cc *ClientConn) int {
@@ -5664,14 +5975,21 @@ func TestTransportRetriesOnStreamProtocolError(t *testing.T) {
 }
 
 func TestClientConnReservations(t *testing.T) {
-	cc := &ClientConn{
-		reqHeaderMu:          make(chan struct{}, 1),
-		streams:              make(map[uint32]*clientStream),
-		maxConcurrentStreams: initialMaxConcurrentStreams,
-		nextStreamID:         1,
-		t:                    &Transport{},
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+	}, func(s *Server) {
+		s.MaxConcurrentStreams = initialMaxConcurrentStreams
+	})
+	defer st.Close()
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+	defer tr.CloseIdleConnections()
+
+	cc, err := tr.newClientConn(st.cc, false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cc.cond = sync.NewCond(&cc.mu)
+
+	req, _ := http.NewRequest("GET", st.ts.URL, nil)
 	n := 0
 	for n <= initialMaxConcurrentStreams && cc.ReserveNewRequest() {
 		n++
@@ -5679,8 +5997,8 @@ func TestClientConnReservations(t *testing.T) {
 	if n != initialMaxConcurrentStreams {
 		t.Errorf("did %v reservations; want %v", n, initialMaxConcurrentStreams)
 	}
-	if _, err := cc.RoundTrip(new(http.Request)); !errors.Is(err, errNilRequestURL) {
-		t.Fatalf("RoundTrip error = %v; want errNilRequestURL", err)
+	if _, err := cc.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip error = %v", err)
 	}
 	n2 := 0
 	for n2 <= 5 && cc.ReserveNewRequest() {
@@ -5692,7 +6010,7 @@ func TestClientConnReservations(t *testing.T) {
 
 	// Use up all the reservations
 	for i := 0; i < n; i++ {
-		cc.RoundTrip(new(http.Request))
+		cc.RoundTrip(req)
 	}
 
 	n2 = 0
@@ -5921,4 +6239,130 @@ func TestTransportSlowWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+}
+
+func TestTransportClosesConnAfterGoAwayNoStreams(t *testing.T) {
+	testTransportClosesConnAfterGoAway(t, 0)
+}
+func TestTransportClosesConnAfterGoAwayLastStream(t *testing.T) {
+	testTransportClosesConnAfterGoAway(t, 1)
+}
+
+type closeOnceConn struct {
+	net.Conn
+	closed uint32
+}
+
+var errClosed = errors.New("Close of closed connection")
+
+func (c *closeOnceConn) Close() error {
+	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
+		return c.Conn.Close()
+	}
+	return errClosed
+}
+
+// testTransportClosesConnAfterGoAway verifies that the transport
+// closes a connection after reading a GOAWAY from it.
+//
+// lastStream is the last stream ID in the GOAWAY frame.
+// When 0, the transport (unsuccessfully) retries the request (stream 1);
+// when 1, the transport reads the response after receiving the GOAWAY.
+func testTransportClosesConnAfterGoAway(t *testing.T, lastStream uint32) {
+	ct := newClientTester(t)
+	ct.cc = &closeOnceConn{Conn: ct.cc}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ct.client = func() error {
+		defer wg.Done()
+		req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
+		res, err := ct.tr.RoundTrip(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		if gotErr, wantErr := err != nil, lastStream == 0; gotErr != wantErr {
+			t.Errorf("RoundTrip got error %v (want error: %v)", err, wantErr)
+		}
+		if err = ct.cc.Close(); err != errClosed {
+			return fmt.Errorf("ct.cc.Close() = %v, want errClosed", err)
+		}
+		return nil
+	}
+
+	ct.server = func() error {
+		defer wg.Wait()
+		ct.greet()
+		hf, err := ct.firstHeaders()
+		if err != nil {
+			return fmt.Errorf("server failed reading HEADERS: %v", err)
+		}
+		if err := ct.fr.WriteGoAway(lastStream, ErrCodeNo, nil); err != nil {
+			return fmt.Errorf("server failed writing GOAWAY: %v", err)
+		}
+		if lastStream > 0 {
+			// Send a valid response to first request.
+			var buf bytes.Buffer
+			enc := hpack.NewEncoder(&buf)
+			enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+			ct.fr.WriteHeaders(HeadersFrameParam{
+				StreamID:      hf.StreamID,
+				EndHeaders:    true,
+				EndStream:     true,
+				BlockFragment: buf.Bytes(),
+			})
+		}
+		return nil
+	}
+
+	ct.run()
+}
+
+type slowCloser struct {
+	closing chan struct{}
+	closed  chan struct{}
+}
+
+func (r *slowCloser) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (r *slowCloser) Close() error {
+	close(r.closing)
+	<-r.closed
+	return nil
+}
+
+func TestTransportSlowClose(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+	}, optOnlyServer)
+	defer st.Close()
+
+	client := st.ts.Client()
+	body := &slowCloser{
+		closing: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+
+	reqc := make(chan struct{})
+	go func() {
+		defer close(reqc)
+		res, err := client.Post(st.ts.URL, "text/plain", body)
+		if err != nil {
+			t.Error(err)
+		}
+		res.Body.Close()
+	}()
+	defer func() {
+		close(body.closed)
+		<-reqc // wait for POST request to finish
+	}()
+
+	<-body.closing // wait for POST request to call body.Close
+	// This GET request should not be blocked by the in-progress POST.
+	res, err := client.Get(st.ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
 }

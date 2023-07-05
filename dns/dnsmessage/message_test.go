@@ -211,26 +211,38 @@ func TestName(t *testing.T) {
 	}
 }
 
+func TestNameWithDotsUnpack(t *testing.T) {
+	name := []byte{3, 'w', '.', 'w', 2, 'g', 'o', 3, 'd', 'e', 'v', 0}
+	var n Name
+	_, err := n.unpack(name, 0)
+	if err != errInvalidName {
+		t.Fatalf("expected %v, got %v", errInvalidName, err)
+	}
+}
+
 func TestNamePackUnpack(t *testing.T) {
+	const suffix = ".go.dev."
+	var longDNSPrefix = strings.Repeat("verylongdomainlabel.", 20)
+
 	tests := []struct {
-		in   string
-		want string
-		err  error
+		in  string
+		err error
 	}{
-		{"", "", errNonCanonicalName},
-		{".", ".", nil},
-		{"google..com", "", errNonCanonicalName},
-		{"google.com", "", errNonCanonicalName},
-		{"google..com.", "", errZeroSegLen},
-		{"google.com.", "google.com.", nil},
-		{".google.com.", "", errZeroSegLen},
-		{"www..google.com.", "", errZeroSegLen},
-		{"www.google.com.", "www.google.com.", nil},
+		{"", errNonCanonicalName},
+		{".", nil},
+		{"google..com", errNonCanonicalName},
+		{"google.com", errNonCanonicalName},
+		{"google..com.", errZeroSegLen},
+		{"google.com.", nil},
+		{".google.com.", errZeroSegLen},
+		{"www..google.com.", errZeroSegLen},
+		{"www.google.com.", nil},
+		{in: longDNSPrefix[:254-len(suffix)] + suffix},                      // 254B name, with ending dot.
+		{in: longDNSPrefix[:255-len(suffix)] + suffix, err: errNameTooLong}, // 255B name, with ending dot.
 	}
 
 	for _, test := range tests {
 		in := MustNewName(test.in)
-		want := MustNewName(test.want)
 		buf, err := in.pack(make([]byte, 0, 30), map[string]int{}, 0)
 		if err != test.err {
 			t.Errorf("got %q.pack() = %v, want = %v", test.in, err, test.err)
@@ -253,8 +265,40 @@ func TestNamePackUnpack(t *testing.T) {
 				len(buf),
 			)
 		}
-		if got != want {
-			t.Errorf("unpacking packing of %q: got = %#v, want = %#v", test.in, got, want)
+		if got != in {
+			t.Errorf("unpacking packing of %q: got = %#v, want = %#v", test.in, got, in)
+		}
+	}
+}
+
+func TestNameUnpackTooLongName(t *testing.T) {
+	var suffix = []byte{2, 'g', 'o', 3, 'd', 'e', 'v', 0}
+
+	const label = "longdnslabel"
+	labelBinary := append([]byte{byte(len(label))}, []byte(label)...)
+	var longDNSPrefix = bytes.Repeat(labelBinary, 18)
+	longDNSPrefix = longDNSPrefix[:len(longDNSPrefix):len(longDNSPrefix)]
+
+	prepName := func(length int) []byte {
+		missing := length - (len(longDNSPrefix) + len(suffix) + 1)
+		name := append(longDNSPrefix, byte(missing))
+		name = append(name, bytes.Repeat([]byte{'a'}, missing)...)
+		return append(name, suffix...)
+	}
+
+	tests := []struct {
+		name []byte
+		err  error
+	}{
+		{name: prepName(255)},
+		{name: prepName(256), err: errNameTooLong},
+	}
+
+	for i, test := range tests {
+		var got Name
+		_, err := got.unpack(test.name, 0)
+		if err != test.err {
+			t.Errorf("%v: %v: expected error: %v, got %v", i, test.name, test.err, err)
 		}
 	}
 }

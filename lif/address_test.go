@@ -9,6 +9,7 @@ package lif
 
 import (
 	"fmt"
+	"syscall"
 	"testing"
 )
 
@@ -16,11 +17,11 @@ type addrFamily int
 
 func (af addrFamily) String() string {
 	switch af {
-	case sysAF_UNSPEC:
+	case syscall.AF_UNSPEC:
 		return "unspec"
-	case sysAF_INET:
+	case syscall.AF_INET:
 		return "inet4"
-	case sysAF_INET6:
+	case syscall.AF_INET6:
 		return "inet6"
 	default:
 		return fmt.Sprintf("%d", af)
@@ -81,7 +82,7 @@ type addrPack struct {
 func addrPacks() ([]addrPack, error) {
 	var lastErr error
 	var aps []addrPack
-	for _, af := range [...]int{sysAF_UNSPEC, sysAF_INET, sysAF_INET6} {
+	for _, af := range [...]int{syscall.AF_UNSPEC, syscall.AF_INET, syscall.AF_INET6} {
 		as, err := Addrs(af, "")
 		if err != nil {
 			lastErr = err
